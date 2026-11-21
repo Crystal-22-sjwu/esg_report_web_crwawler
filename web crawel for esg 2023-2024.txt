@@ -1,0 +1,524 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jan 20 14:20:53 2026
+
+@author: kevin
+"""
+
+# -*- coding: utf-8 -*-
+"""
+TWSE ESG GenPlus 永續報告書自動下載器（單一 Chrome / Excel 倒序 / 2023 探測市場 -> 2024 只查該市場 / 查無快速跳過）
+規則：
+- Excel 從最後一筆往前跑
+- 整批只開一個 Chrome，不因公司切換而關掉或重開
+- 每家公司先跑 2023（探測市場別）：
+    * 若 2023 只有上市成功 → 2024 只查上市
+    * 若 2023 只有上櫃成功 → 2024 只查上櫃
+    * 若 2023 兩邊都成功 → 2024 兩邊都查（避免漏抓）
+    * 若 2023 兩邊都查無 → 2024 兩邊都查（避免 2024 才發布而漏掉）
+- 檔名固定：公司代碼_公司名字_年份.pdf（不含市場別）
+- 同公司同年度若下載到多份 → 以「最後下載成功」覆蓋同名檔（最新下載為準）
+- 查無資料時不要硬等 10 秒：改成「快速偵測 2 秒 + 正常等待 8 秒」
+"""
+
+import re
+import time
+import shutil
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+# =========================
+# 使用者設定
+# =========================
+URL = "https://esggenplus.twse.com.tw/inquiry/report?lang=zh-TW"
+
+EXCEL_PATH = r"C:\Users\kevin\Desktop\主產業1.xlsx"
+EXCEL_STOCK_COL = "StockCode"
+EXCEL_NAME_COL = "CompanyName"
+
+YEARS = [2023, 2024]
+MARKETS = ["上市", "上櫃"]
+
+FINAL_OUTPUT_DIR = r"C:\Users\kevin\Desktop\公司永續報告書"
+
+HEADLESS = False
+PAGE_LOAD_TIMEOUT = 45
+WAIT_TIMEOUT = 16
+DOWNLOAD_TIMEOUT = 180
+TINY_SLEEP = 0.14
+
+
+# =========================
+# 工具函數
+# =========================
+def safe_text(name: str) -> str:
+    name = str(name) if name is not None else ""
+    name = name.strip()
+    name = re.sub(r"[\u3000\s]+", "", name)  # 去所有空白含全形
+    return name
+
+
+def safe_filename(name: str) -> str:
+    name = str(name) if name is not None else ""
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+    return name[:180] if len(name) > 180 else name
+
+
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def build_driver(download_dir: str) -> webdriver.Chrome:
+    chrome_options = webdriver.ChromeOptions()
+    prefs = {
+        "download.default_directory": download_dir,
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": True,
+        "plugins.always_open_pdf_externally": True,
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--start-maximized")
+    chrome_options.add_argument("--disable-notifications")
+    if HEADLESS:
+        chrome_options.add_argument("--headless=new")
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
+    return driver
+
+
+def js_click(driver, element):
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+    driver.execute_script("arguments[0].click();", element)
+
+
+def wait_overlay_gone(driver, timeout=3):
+    end = time.time() + timeout
+    selectors = [
+        ".el-overlay", ".el-loading-mask",
+        ".el-dialog__wrapper", ".el-message-box__wrapper",
+        ".el-popper.is-pure", ".el-select__popper", ".el-popover"
+    ]
+    while time.time() < end:
+        visible = False
+        for sel in selectors:
+            for e in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if e.is_displayed():
+                        visible = True
+                        break
+                except Exception:
+                    pass
+            if visible:
+                break
+        if not visible:
+            return
+        time.sleep(0.10)
+
+
+def clear_select(driver, placeholder_keyword: str):
+    wait = WebDriverWait(driver, WAIT_TIMEOUT)
+    inp = wait.until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, f"input[placeholder*='{placeholder_keyword}']"))
+    )
+    wait_overlay_gone(driver, timeout=2)
+
+    # 嘗試點 x 清除
+    try:
+        parent = inp.find_element(By.XPATH, "./ancestor::*[1]")
+        clear_icons = parent.find_elements(By.CSS_SELECTOR, ".el-input__clear")
+        if clear_icons:
+            try:
+                clear_icons[0].click()
+            except Exception:
+                js_click(driver, clear_icons[0])
+            time.sleep(TINY_SLEEP)
+            return
+    except Exception:
+        pass
+
+    # fallback：鍵盤清空
+    try:
+        inp.click()
+    except Exception:
+        js_click(driver, inp)
+    time.sleep(TINY_SLEEP)
+    inp.send_keys(Keys.CONTROL, "a")
+    inp.send_keys(Keys.BACKSPACE)
+    time.sleep(TINY_SLEEP)
+
+
+def open_select_and_choose(driver, placeholder_keyword: str, option_text: str, allow_typing: bool = False):
+    wait = WebDriverWait(driver, WAIT_TIMEOUT)
+    inp = wait.until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, f"input[placeholder*='{placeholder_keyword}']"))
+    )
+
+    wait_overlay_gone(driver, timeout=2)
+    try:
+        inp.click()
+    except Exception:
+        js_click(driver, inp)
+    time.sleep(TINY_SLEEP)
+    wait_overlay_gone(driver, timeout=2)
+
+    if allow_typing:
+        try:
+            inp.send_keys(Keys.CONTROL, "a")
+            inp.send_keys(Keys.BACKSPACE)
+        except Exception:
+            pass
+        inp.send_keys(str(option_text))
+        time.sleep(TINY_SLEEP)
+
+    option_locator = (
+        By.XPATH,
+        f"//*[contains(@class,'el-select-dropdown__item') or contains(@class,'option-item')]"
+        f"[contains(normalize-space(.), '{option_text}')]"
+    )
+    opt = wait.until(EC.presence_of_element_located(option_locator))
+
+    try:
+        opt.click()
+    except Exception:
+        js_click(driver, opt)
+
+    time.sleep(TINY_SLEEP)
+    wait_overlay_gone(driver, timeout=2)
+
+
+def click_query(driver):
+    wait = WebDriverWait(driver, WAIT_TIMEOUT)
+    candidates = [
+        (By.XPATH, "//button[contains(normalize-space(.),'查詢')]"),
+        (By.XPATH, "//*[self::button or self::div or self::span][contains(normalize-space(.),'查詢')]"),
+    ]
+    last_err = None
+    for loc in candidates:
+        try:
+            btn = wait.until(EC.presence_of_element_located(loc))
+            wait_overlay_gone(driver, timeout=2)
+            try:
+                btn.click()
+            except Exception:
+                js_click(driver, btn)
+            return
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
+def is_no_data_page(driver) -> bool:
+    """
+    更快、更全面判斷「查無資料」：
+    - body 文字關鍵字
+    - ElementUI empty 狀態（el-empty）
+    """
+    try:
+        body_text = (driver.find_element(By.TAG_NAME, "body").text or "")
+    except Exception:
+        body_text = ""
+
+    t = re.sub(r"\s+", "", body_text)
+    keywords = ["查無資料", "無資料", "無符合", "沒有資料", "0筆", "0筆資料", "查無此資料", "NoData"]
+    if any(k in t for k in keywords):
+        return True
+
+    try:
+        empties = driver.find_elements(By.CSS_SELECTOR, ".el-empty, .el-empty__description")
+        for e in empties:
+            if e.is_displayed():
+                et = re.sub(r"\s+", "", (e.text or ""))
+                if any(k in et for k in ["查無資料", "無資料", "0筆", "沒有資料", "無符合"]):
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+def wait_for_results_ready_or_no_data_fast(driver, quick_wait=2.0, full_wait=8.0) -> str:
+    """
+    兩段式等待：
+    - 先快速偵測（上市查無通常很快出現）
+    - 沒偵測到再進入正常等待結果渲染
+    回傳：ok / no_data / timeout
+    """
+    end_quick = time.time() + quick_wait
+    while time.time() < end_quick:
+        if is_no_data_page(driver):
+            return "no_data"
+        els = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.),'中文版報告書')]")
+        if any(e.is_displayed() for e in els):
+            return "ok"
+        time.sleep(0.10)
+
+    end_full = time.time() + full_wait
+    while time.time() < end_full:
+        if is_no_data_page(driver):
+            return "no_data"
+        els = driver.find_elements(By.XPATH, "//*[contains(normalize-space(.),'中文版報告書')]")
+        if any(e.is_displayed() for e in els):
+            return "ok"
+        time.sleep(0.20)
+
+    if is_no_data_page(driver):
+        return "no_data"
+    return "timeout"
+
+
+def click_download_pdf_in_chinese_section(driver, max_retry=6) -> bool:
+    download_xpath = (
+        "//*[contains(normalize-space(.),'中文版報告書')]/following::*"
+        "[self::a or self::button or self::span or self::div]"
+        "[contains(normalize-space(.),'下載') and contains(normalize-space(.),'PDF')]"
+    )
+
+    candidates = driver.find_elements(By.XPATH, download_xpath)
+    candidates = [c for c in candidates if c.is_displayed()]
+    if not candidates:
+        return False
+
+    def score(el):
+        t = (el.text or "").replace(" ", "")
+        if t == "下載PDF":
+            return 100
+        return 50 if ("下載" in t and "PDF" in t) else 0
+
+    candidates.sort(key=score, reverse=True)
+    target = candidates[0]
+
+    for _ in range(max_retry):
+        try:
+            wait_overlay_gone(driver, timeout=2)
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+            time.sleep(TINY_SLEEP)
+            try:
+                target.click()
+            except Exception:
+                js_click(driver, target)
+            return True
+        except Exception:
+            time.sleep(0.25)
+
+    return False
+
+
+def wait_for_download_file(download_dir: str, timeout: int = DOWNLOAD_TIMEOUT) -> str:
+    end = time.time() + timeout
+    download_path = Path(download_dir)
+
+    while time.time() < end:
+        crs = list(download_path.glob("*.crdownload"))
+        pdfs = list(download_path.glob("*.pdf"))
+
+        if pdfs and not crs:
+            pdfs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            return str(pdfs[0])
+
+        time.sleep(0.30)
+
+    raise TimeoutError("等待下載逾時：未在指定時間內取得 PDF 檔案。")
+
+
+def move_pdf_to_final_overwrite(pdf_path: str, out_dir: Path, year: int, stock: str, cname: str) -> Path:
+    cname = safe_text(cname)
+    base = f"{stock}_{cname}_{year}.pdf" if cname else f"{stock}_{year}.pdf"
+    base = safe_filename(base)
+    dest = out_dir / base
+
+    # 覆蓋策略：存在就刪掉再 move（最新下載為準）
+    if dest.exists():
+        try:
+            dest.unlink()
+        except Exception:
+            bak = out_dir / (dest.stem + "_old" + dest.suffix)
+            try:
+                if bak.exists():
+                    bak.unlink()
+                dest.rename(bak)
+            except Exception:
+                pass
+
+    shutil.move(pdf_path, str(dest))
+    return dest
+
+
+def try_download_one(driver, run_download_dir: str, stock: str, cname: str, year: int, market: str):
+    """
+    回傳 (status, saved_path_or_none)
+    status: downloaded / no_data / no_download_button / error
+    並保證：每次結束回到查詢頁（不關 Chrome）
+    """
+    try:
+        # 確保在查詢頁
+        if URL not in driver.current_url:
+            driver.get(URL)
+            WebDriverWait(driver, WAIT_TIMEOUT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder*='市場別']"))
+            )
+
+        clear_select(driver, "市場別")
+        open_select_and_choose(driver, "市場別", market, allow_typing=False)
+
+        clear_select(driver, "報告年度")
+        open_select_and_choose(driver, "報告年度", str(year), allow_typing=False)
+
+        clear_select(driver, "公司代號")
+        open_select_and_choose(driver, "公司代號", str(stock), allow_typing=True)
+
+        try:
+            inp_company = driver.find_element(By.CSS_SELECTOR, "input[placeholder*='公司代號']")
+            inp_company.send_keys(Keys.ENTER)
+        except Exception:
+            pass
+
+        click_query(driver)
+
+        status = wait_for_results_ready_or_no_data_fast(driver, quick_wait=2.0, full_wait=8.0)
+        if status == "no_data":
+            return "no_data", None
+        if status == "timeout":
+            if is_no_data_page(driver):
+                return "no_data", None
+            return "error", None
+
+        ok = click_download_pdf_in_chinese_section(driver, max_retry=6)
+        if not ok:
+            return "no_download_button", None
+
+        pdf_path = wait_for_download_file(run_download_dir, timeout=DOWNLOAD_TIMEOUT)
+        dest = move_pdf_to_final_overwrite(pdf_path, Path(FINAL_OUTPUT_DIR), year, stock, cname)
+        return "downloaded", str(dest)
+
+    except Exception:
+        return "error", None
+
+    finally:
+        # 回到查詢頁（不關 Chrome）
+        try:
+            driver.get(URL)
+            WebDriverWait(driver, WAIT_TIMEOUT).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder*='市場別']"))
+            )
+        except Exception:
+            pass
+
+
+# =========================
+# 主流程
+# =========================
+def main():
+    df = pd.read_excel(EXCEL_PATH, engine="openpyxl")
+    if EXCEL_STOCK_COL not in df.columns:
+        raise ValueError(f"Excel 找不到欄位：{EXCEL_STOCK_COL}")
+
+    df[EXCEL_STOCK_COL] = df[EXCEL_STOCK_COL].astype(str).str.strip()
+    if EXCEL_NAME_COL in df.columns:
+        df[EXCEL_NAME_COL] = df[EXCEL_NAME_COL].astype(str).str.strip()
+    else:
+        df[EXCEL_NAME_COL] = ""
+
+    out_dir = Path(FINAL_OUTPUT_DIR)
+    ensure_dir(out_dir)
+
+    run_download_dir = tempfile.mkdtemp(prefix="ESG_SINGLE_DRIVER_")
+    driver = None
+    total_download_events = 0
+
+    try:
+        driver = build_driver(run_download_dir)
+        driver.get(URL)
+
+        WebDriverWait(driver, WAIT_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[placeholder*='市場別']"))
+        )
+
+        print("已開啟頁面（單一 Chrome），開始由 Excel 最後一筆往前跑...")
+
+        df_rev = df.iloc[::-1].reset_index(drop=True)
+
+        for _, row in df_rev.iterrows():
+            stock = str(row[EXCEL_STOCK_COL]).strip()
+            cname = row.get(EXCEL_NAME_COL, "")
+
+            if not stock or stock.lower() == "nan":
+                continue
+
+            # A) 先跑 2023 探測市場（同時會下載 2023）
+            probe_year = YEARS[0]  # 2023
+            probe_result = {}      # market -> status
+            print(f"\n[探測] 公司 {stock} / 年度 {probe_year}")
+
+            for market in MARKETS:
+                st, saved = try_download_one(driver, run_download_dir, stock, cname, probe_year, market)
+                probe_result[market] = st
+
+                if st == "downloaded":
+                    total_download_events += 1
+                    print(f"[探測] {market} 下載成功（已寫入/覆蓋）：{saved}")
+                elif st == "no_data":
+                    print(f"[探測] {market} 查無資料")
+                elif st == "no_download_button":
+                    print(f"[探測] {market} 有結果但找不到下載按鈕")
+                else:
+                    print(f"[探測] {market} 發生錯誤/逾時")
+
+            # 決定 2024 市場查詢範圍（加速減半）
+            if probe_result.get("上市") == "downloaded" and probe_result.get("上櫃") != "downloaded":
+                chosen_2024 = ["上市"]
+            elif probe_result.get("上櫃") == "downloaded" and probe_result.get("上市") != "downloaded":
+                chosen_2024 = ["上櫃"]
+            else:
+                chosen_2024 = ["上市", "上櫃"]  # 兩邊都成功 或 兩邊都無資料 → 都查
+
+            # B) 跑 2024（只查探測到的市場，或必要時兩邊都查）
+            if len(YEARS) > 1:
+                year_2024 = YEARS[1]
+                print(f"[加速] 公司 {stock} / 年度 {year_2024}：市場查詢範圍 = {chosen_2024}")
+
+                for market in chosen_2024:
+                    st, saved = try_download_one(driver, run_download_dir, stock, cname, year_2024, market)
+
+                    if st == "downloaded":
+                        total_download_events += 1
+                        print(f"{market} 下載成功（已寫入/覆蓋）：{saved}")
+                    elif st == "no_data":
+                        print(f"{market} 查無資料")
+                    elif st == "no_download_button":
+                        print(f"{market} 有結果但找不到下載按鈕")
+                    else:
+                        print(f"{market} 發生錯誤/逾時")
+
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+        try:
+            shutil.rmtree(run_download_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    print("\n========== 完成 ==========")
+    print(f"下載事件（含覆蓋）共 {total_download_events} 次")
+    print(f"PDF 全部輸出到：{out_dir}")
+
+
+if __name__ == "__main__":
+    main()
